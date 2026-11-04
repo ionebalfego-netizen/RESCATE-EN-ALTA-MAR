@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Rescate en alta mar</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+/* Marco negro alrededor del juego (letterbox) */
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #05080f;
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Press Start 2P', 'Courier New', monospace;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;          /* el arrastre es el joystick, no hace scroll */
+  overscroll-behavior: none;
+}
+
+/* Contenedor del lienzo (en la fase 4 llevará encima el efecto CRT) */
+#screen {
+  position: relative;
+  line-height: 0;
+}
+
+/* El lienzo interno es 320x180; JS fija su tamaño CSS manteniendo 16:9 */
+#game {
+  display: block;
+  image-rendering: crisp-edges;
+  image-rendering: pixelated;  /* sin suavizado */
+  touch-action: none;
+}
+
+/* Efecto CRT (se activa con la tecla C): scanlines suaves de 1 píxel de juego + viñeta */
+#crt {
+  position: absolute; inset: 0; pointer-events: none; display: none;
+  background:
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,.5) 100%),
+    repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0, rgba(0,0,0,0) calc(var(--s, 3px) * .55),
+      rgba(0,0,0,.2) calc(var(--s, 3px) * .55), rgba(0,0,0,.2) var(--s, 3px));
+  box-shadow: inset 0 0 40px rgba(0,0,0,.35);
+}
+#crt.on { display: block; }
+
+/* Aviso en móvil vertical */
+#rotate {
+  display: none; position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 6px;
+  text-align: center; font-size: 9px; color: #ffd23f; background: #0b1426; pointer-events: none; z-index: 5;
+}
+@media (orientation: portrait) and (max-width: 700px) { #rotate { display: block; } }
+</style>
+</head>
+<body>
+<div id="screen">
+  <canvas id="game" width="320" height="180" aria-label="Rescate en alta mar"></canvas>
+  <div id="crt"></div>   <!-- efecto CRT (tecla C) -->
+</div>
+<div id="rotate">GIRA EL MÓVIL PARA JUGAR MEJOR</div>
+<!-- Scripts clásicos (no módulos) para que funcione abriendo index.html con doble clic -->
+<script>
+'use strict';
+/* ==========================================================
+   sprites.js - Paleta y sprites pixel art (todo definido en código)
+   ========================================================== */
+
+/* ---------- PALETA (25 colores; quedan 7 libres para fases siguientes) ---------- */
+const PAL = {
+  // Marinos
+  ink: '#0b1426', abyss: '#0f2a4a', deep: '#123c6b',
+  sea1: '#1a5a94', sea2: '#2478b5', sea3: '#3a9bd0',
+  foam1: '#8fd3ea', foam2: '#e3f8fa', white: '#ffffff',
+  // Tierra / madera
+  sand: '#e8c987', sandDk: '#b98b52', wood: '#7a4a2a', woodDk: '#4a2c1a',
+  // Neutros y lancha
+  red: '#d9382e', redDk: '#8f1f24', cream: '#f2efe6', gray: '#9aa5b1', grayDk: '#505a69',
+  // Acentos cálidos (náufragos, puntuación) y extras
+  yellow: '#ffd23f', orange: '#ff8a2b', skin: '#f0b48a',
+  green: '#3fa34d', greenDk: '#1f6b3a', purple: '#6b3fa0', pink: '#ff6b8a'
+};
+
+const Sprites = (() => {
+  const S = { boat: [[], []], boatShadow: [], waterA: null, waterB: [], swellMid: [], swellTop: [], DIRS: 16 };
+
+  /* ---------- Utilidades ---------- */
+  function makeCanvas(w, h) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    return c;
+  }
+
+  // Generador pseudoaleatorio con semilla (el agua es igual en cada carga)
+  function rng(seed) {
+    return () => {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Convierte una matriz de texto en canvas. legend: carácter -> clave de PAL
+  function fromMatrix(rows, legend) {
+    const c = makeCanvas(rows[0].length, rows.length);
+    const g = c.getContext('2d');
+    rows.forEach((row, y) => {
+      for (let x = 0; x < row.length; x++) {
+        const k = legend[row[x]];
+        if (k) { g.fillStyle = PAL[k]; g.fillRect(x, y, 1, 1); }
+      }
+    });
+    return c;
+  }
+
+  // Rota un sprite por vecino más cercano: mantiene los píxeles nítidos
+  function rotateNearest(src, angle) {
+    const w = src.width, h = src.height;
+    const sd = src.getContext('2d').getImageData(0, 0, w, h).data;
+    const out = makeCanvas(w, h), og = out.getContext('2d');
+    const img = og.createImageData(w, h), od = img.data;
+    const ca = Math.cos(angle), sa = Math.sin(angle);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const dx = x + 0.5 - w / 2, dy = y + 0.5 - h / 2;
+        const sx = Math.floor(ca * dx + sa * dy + w / 2);
+        const sy = Math.floor(-sa * dx + ca * dy + h / 2);
+        if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+          const si = (sy * w + sx) * 4, di = (y * w + x) * 4;
+          od[di] = sd[si]; od[di + 1] = sd[si + 1]; od[di + 2] = sd[si + 2]; od[di + 3] = sd[si + 3];
+        }
+      }
+    }
+    og.putImageData(img, 0, 0);
+    return out;
+  }
+
+  // Silueta de un solo color (para la sombra sobre el agua)
+  function silhouette(src, hex) {
+    const w = src.width, h = src.height;
+    const out = makeCanvas(w, h), g = out.getContext('2d');
+    g.drawImage(src, 0, 0);
+    const img = g.getImageData(0, 0, w, h), d = img.data;
+    const r = parseInt(hex.slice(1, 3), 16), gr = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] > 0) { d[i] = r; d[i + 1] = gr; d[i + 2] = b; d[i + 3] = 255; }
+    }
+    g.putImageData(img, 0, 0);
+    return out;
+  }
+
+  // Línea horizontal de píxeles con repetición (tile sin costuras)
+  function wrapH(g, color, x, y, len, size) {
+    g.fillStyle = color;
+    for (let i = 0; i < len; i++) g.fillRect((x + i) % size, y % size, 1, 1);
+  }
+
+  /* ---------- LANCHA (16x16, mira a la derecha; 2 fotogramas) ---------- */
+  const BOAT_LEGEND = { K: 'ink', R: 'red', r: 'redDk', W: 'cream', G: 'gray', g: 'grayDk', S: 'skin', C: 'foam1', w: 'white' };
+  const BOAT_A = [
+    '................', '................', '................', '................',
+    '..KKKKKKKKKK....',
+    '.KRRRRRRRRRRKK..',
+    'KRRWWWWWWRRRRRK.',
+    'KRWWSSGGWCRRRRRK',
+    'KRWWSSGGWCRRRRRK',
+    'KRRWWWWWWRRRRRK.',
+    '.KRRRRRRRRRRKK..',
+    '..KKKKKKKKKK....',
+    '................', '................', '................', '................'
+  ];
+  // Fotograma B: el piloto se inclina y el parabrisas brilla
+  const BOAT_B = BOAT_A.slice();
+  BOAT_B[7] = 'KRWSSSGGWwRRRRRK';
+  BOAT_B[8] = 'KRWWSSGGWwRRRRRK';
+
+  function buildBoat() {
+    [BOAT_A, BOAT_B].forEach((m, f) => {
+      const base = fromMatrix(m, BOAT_LEGEND);
+      for (let d = 0; d < S.DIRS; d++) {
+        const rot = rotateNearest(base, d * Math.PI * 2 / S.DIRS);
+        S.boat[f].push(rot);
+        if (f === 0) S.boatShadow.push(silhouette(rot, PAL.sea1));
+      }
+    });
+  }
+
+  /* ---------- AGUA ---------- */
+  // Capa A: trazos de ola claros con sombra, 64x64
+  function buildWaterA() {
+    const N = 64, c = makeCanvas(N, N), g = c.getContext('2d'), r = rng(1234);
+    for (let cy = 0; cy < 4; cy++) for (let cx = 0; cx < 4; cx++) {
+      const len = 5 + Math.floor(r() * 5);
+      const x = cx * 16 + Math.floor(r() * 8), y = cy * 16 + 2 + Math.floor(r() * 11);
+      wrapH(g, PAL.sea3, x, y, len, N);
+      wrapH(g, PAL.sea1, x + 2, y + 1, len - 3, N);
+    }
+    S.waterA = c;
+  }
+
+  // Capa B: espuma que "respira" en 4 fotogramas, 64x64
+  function buildWaterB() {
+    const N = 64, lens = [2, 4, 6, 4];
+    for (let f = 0; f < 4; f++) {
+      const c = makeCanvas(N, N), g = c.getContext('2d'), r = rng(777);
+      for (let cy = 0; cy < 4; cy++) for (let cx = 0; cx < 2; cx++) {
+        const x = cx * 32 + Math.floor(r() * 20), y = cy * 16 + 3 + Math.floor(r() * 10);
+        const len = lens[(f + cx + cy) % 4];
+        wrapH(g, PAL.foam1, x, y, len, N);
+        if (len >= 4) wrapH(g, PAL.foam2, x + (len >> 1), y - 1, 1, N);
+      }
+      S.waterB.push(c);
+    }
+  }
+
+  // Franjas de oleaje: una fila de píxeles en damero (2 paridades), más ancha que la pantalla
+  function buildSwell(W) {
+    const w = W + 16;
+    [['swellMid', PAL.sea3], ['swellTop', PAL.foam1]].forEach(([key, color]) => {
+      for (let p = 0; p < 2; p++) {
+        const c = makeCanvas(w, 1), g = c.getContext('2d');
+        g.fillStyle = color;
+        for (let x = p; x < w; x += 2) g.fillRect(x, 0, 1, 1);
+        S[key].push(c);
+      }
+    });
+  }
+
+
+  /* ---------- NÁUFRAGO (8x7, 3 poses; se anima en secuencia 0-1-2-1 saludando) ---------- */
+  const CAST_LEGEND = { S: 'skin', H: 'woodDk', O: 'orange', f: 'foam1', y: 'yellow' };
+  const CAST = [
+    ['S.HHHH.S', 'S.SSSS.S', '.SOOOOS.', '..OyyO..', '.ffffff.', 'f.ffff.f', '........'],
+    ['..HHHH..', 'S.SSSS.S', 'SSOOOOSS', '..OyyO..', '.ffffff.', 'f.ffff.f', '........'],
+    ['..HHHH..', '..SSSS..', '.SOOOOS.', 'SSOyyOSS', '.ffffff.', 'f.ffff.f', '........']
+  ];
+  S.castaway = CAST.map(m => fromMatrix(m, CAST_LEGEND));
+
+  /* ---------- PUERTO (44 px de ancho, borde izquierdo): arena + muelle de madera ---------- */
+  function buildPort(H) {
+    const c = makeCanvas(44, H), g = c.getContext('2d');
+    g.fillStyle = PAL.sand; g.fillRect(0, 0, 8, H);
+    g.fillStyle = PAL.sandDk;
+    for (let y = 2; y < H; y += 5) g.fillRect((y * 7) % 6, y, 2, 1);   // granos de arena
+    g.fillStyle = PAL.sea1; g.fillRect(10, 109, 27, 2);                // sombra del muelle
+    g.fillStyle = PAL.wood; g.fillRect(8, 72, 28, 36);
+    g.fillStyle = PAL.woodDk;
+    for (let x = 11; x < 36; x += 4) g.fillRect(x, 73, 1, 34);         // tablones
+    g.fillRect(8, 72, 28, 1); g.fillRect(8, 107, 28, 1);               // barandillas
+    g.fillRect(34, 70, 3, 3); g.fillRect(34, 107, 3, 3);               // pilotes
+    S.port = c;
+  }
+
+  /* ---------- OBSTÁCULOS Y VIDAS ---------- */
+  S.rock = fromMatrix([
+    '....KKKKKK....', '..KKGGGGGGKK..', '.KGGWWGGGGGGK.', 'KGGWWGGGGGGggK', 'KGGGGGGGGggggK',
+    'KgGGGGGGggggK.', '.KggggggggggK.', '..KKggggggKK..', '....KKKKKK....'
+  ], { K: 'ink', G: 'gray', g: 'grayDk', W: 'cream' });
+
+  // Boya de 2 fotogramas: la luz parpadea
+  const BUOY = ['...LL...', '..KRRK..', '.KWWWWK.', '.KRRRRK.', '.KWWWWK.', '.KRRRRK.', 'KKKKKKKK'];
+  S.buoy = ['yellow', 'grayDk'].map(l => fromMatrix(BUOY, { K: 'ink', R: 'red', W: 'cream', L: l }));
+
+  // Corazón de vida (lleno y vacío)
+  const HEART = ['.RR..RR.', 'RwRRRRRR', 'RRRRRRRR', '.RRRRRR.', '..RRRR..', '...RR...'];
+  S.heart = [fromMatrix(HEART, { R: 'red', w: 'pink' }), fromMatrix(HEART, { R: 'grayDk', w: 'grayDk' })];
+
+  // Remolino: 4 fotogramas, 3 brazos en espiral (el giro de 1/4 de brazo encaja en bucle)
+  S.whirl = [];
+  for (let f = 0; f < 4; f++) {
+    const c = makeCanvas(21, 21), g = c.getContext('2d');
+    for (let y = 0; y < 21; y++) for (let x = 0; x < 21; x++) {
+      const d = Math.hypot(x - 10, y - 10);
+      if (d <= 10) { g.fillStyle = d <= 3 ? PAL.abyss : d <= 6 ? PAL.deep : PAL.sea1; g.fillRect(x, y, 1, 1); }
+    }
+    for (let k = 0; k < 3; k++) for (let r = 3; r <= 10; r += 0.5) {
+      const a = k * Math.PI * 2 / 3 + r * 0.55 + f * Math.PI / 6;
+      g.fillStyle = r > 7 ? PAL.foam2 : PAL.foam1;
+      g.fillRect(Math.round(10 + Math.cos(a) * r), Math.round(10 + Math.sin(a) * r), 1, 1);
+    }
+    S.whirl.push(c);
+  }
+
+  // Tiburón (16x16, mira a la derecha, aleta dorsal; 2 fotogramas de cola) x 16 direcciones
+  const E = '................';
+  const SHARK_A = [E, E, E, E, '......KK........', '...KKKggKKK.....', '..KGGGGGGGGKK...', 'KKGGGGggGGGGGGKK',
+    'KKGGGGggGGGGGGKK', '..KWWWWWWWWKK...', '...KKKKKKKK.....', E, E, E, E, E];
+  const SHARK_B = SHARK_A.slice();
+  SHARK_B[6] = 'K.KGGGGGGGGKK...'; SHARK_B[7] = SHARK_B[8] = '.KGGGGggGGGGGGKK'; SHARK_B[9] = 'K.KWWWWWWWWKK...';
+  S.shark = [SHARK_A, SHARK_B].map(m => {
+    const base = fromMatrix(m, { K: 'ink', G: 'gray', g: 'grayDk', W: 'cream' });
+    return Array.from({ length: S.DIRS }, (_, d) => rotateNearest(base, d * Math.PI * 2 / S.DIRS));
+  });
+
+  /* ---------- POWER-UPS (insignias redondas de 13x13 con símbolo 7x7) ---------- */
+  const SYM = {
+    turbo: ['#..#...', '.#..#..', '..#..#.', '...#..#', '..#..#.', '.#..#..', '#..#...'],   // >> velocidad
+    magnet: ['##...##', '##...##', '##...##', '##...##', '.##.##.', '..###..', '.......'],  // U de imán
+    shield: ['.#####.', '#######', '#######', '#######', '.#####.', '..###..', '...#...'],  // escudo
+    clock: ['.#####.', '#..#..#', '#..#..#', '#..##.#', '#.....#', '.#####.', '.......']    // reloj
+  };
+  const BADGE = { turbo: ['yellow', 'ink'], magnet: ['red', 'cream'], shield: ['foam1', 'ink'], clock: ['green', 'cream'] };
+  S.powerup = {};
+  for (const k in SYM) {
+    const c = makeCanvas(13, 13), g = c.getContext('2d');
+    for (let y = 0; y < 13; y++) for (let x = 0; x < 13; x++) {
+      const d = Math.hypot(x - 6, y - 6);
+      if (d <= 6.3) { g.fillStyle = d > 5.2 ? PAL.ink : PAL[BADGE[k][0]]; g.fillRect(x, y, 1, 1); }
+    }
+    g.fillStyle = PAL[BADGE[k][1]];
+    SYM[k].forEach((row, y) => { for (let x = 0; x < 7; x++) if (row[x] === '#') g.fillRect(3 + x, 3 + y, 1, 1); });
+    S.powerup[k] = c;
+  }
+
+  S.init = function (W, H) { buildBoat(); buildWaterA(); buildWaterB(); buildSwell(W); buildPort(H); };
+  return S;
+})();
+</script>
+<script>
+'use strict';
+/* ==========================================================
+   audio.js - Música y efectos chiptune con Web Audio API (solo osciladores y ruido)
+   El audio arranca tras la primera interacción (política de los navegadores).
+   ========================================================== */
+const Audio8 = (() => {
+  let ac = null, master = null, musicG = null, sfxG = null, noiseBuf = null, timer = null;
+  let muted = false, wantMusic = true, started = false, paused = false;
+  let step = 0, nextT = 0, six = 0.125;                 // six = duración de una semicorchea
+  const mtof = m => 440 * Math.pow(2, (m - 69) / 12);   // nota MIDI -> Hz
+
+  /* ---------- Generadores básicos ---------- */
+  function tone(f, d, type, v, t, f2, dest) {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+    g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+    o.connect(g); g.connect(dest || sfxG);
+    o.start(t); o.stop(t + d + 0.02);
+  }
+  function noise(d, v, t, dest) {
+    const s = ac.createBufferSource(), g = ac.createGain();
+    s.buffer = noiseBuf;
+    g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+    s.connect(g); g.connect(dest || sfxG);
+    s.start(t, Math.random() * 0.5); s.stop(t + d + 0.02);
+  }
+
+  /* ---------- Música: Am - F - C - G, bajo + arpegio + melodía + percusión ---------- */
+  const CHORDS = [{ r: 45, t: [0, 3, 7] }, { r: 41, t: [0, 4, 7] }, { r: 48, t: [0, 4, 7] }, { r: 43, t: [0, 4, 7] }];
+  const MELODY = [69, 0, 72, 69, 76, 0, 72, 69,   69, 0, 72, 69, 77, 0, 76, 72,
+                  67, 0, 72, 67, 76, 0, 74, 72,   71, 0, 74, 71, 79, 0, 76, 74];   // una nota por corchea
+
+  function playStep(s, t) {
+    const ch = CHORDS[s >> 4];
+    if (s % 8 === 0) tone(150, 0.12, 'sine', 0.5, t, 45, musicG);                          // bombo
+    if (s % 2 === 1) noise(0.03, 0.05, t, musicG);                                          // hi-hat
+    if (s % 4 === 0) tone(mtof(ch.r), 0.22, 'triangle', 0.3, t, null, musicG);              // bajo
+    if (s % 4 === 2) tone(mtof(ch.r + 12), 0.12, 'triangle', 0.2, t, null, musicG);
+    if (s % 2 === 0 && MELODY[s >> 1]) tone(mtof(MELODY[s >> 1]), six * 1.8, 'square', 0.07, t, null, musicG);   // melodía
+    if (s % 2 === 1) tone(mtof(ch.r + 12 + ch.t[(s >> 1) % 3]), six * 1.2, 'square', 0.035, t, null, musicG);   // arpegio
+  }
+
+  // Planificador con margen: programa las notas un poco antes de que suenen
+  function schedule() {
+    if (!ac || ac.state !== 'running') return;
+    if (nextT < ac.currentTime) nextT = ac.currentTime + 0.05;
+    while (nextT < ac.currentTime + 0.15) { playStep(step, nextT); nextT += six; step = (step + 1) % 64; }
+  }
+
+  /* ---------- API pública ---------- */
+  // Llamar desde cualquier gesto del usuario (tecla, clic, toque)
+  function unlock() {
+    if (paused) return;
+    if (!ac) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      ac = new AC();
+      master = ac.createGain(); master.gain.value = muted ? 0 : 0.7; master.connect(ac.destination);
+      musicG = ac.createGain(); musicG.gain.value = wantMusic ? 0.55 : 0; musicG.connect(master);
+      sfxG = ac.createGain(); sfxG.gain.value = 0.8; sfxG.connect(master);
+      noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (ac.state === 'suspended') ac.resume();
+    if (!started) { started = true; timer = setInterval(schedule, 30); }
+  }
+
+  function music(on) {
+    wantMusic = on;
+    if (musicG) musicG.gain.setTargetAtTime(on ? 0.55 : 0, ac.currentTime, 0.15);
+  }
+
+  // La música acelera con el nivel
+  function setLevel(L) { six = 15 / (118 + Math.min(L, 8) * 4); }
+
+  function toggleMute() {
+    muted = !muted;
+    if (master) master.gain.setTargetAtTime(muted ? 0 : 0.7, ac.currentTime, 0.03);
+    return muted;
+  }
+
+  function pause(p) {
+    paused = p;
+    if (ac) { if (p) ac.suspend(); else ac.resume(); }
+  }
+
+  // Efectos de sonido
+  function sfx(name) {
+    if (!ac || ac.state !== 'running') return;
+    const t = ac.currentTime;
+    switch (name) {
+      case 'pickup': tone(660, 0.07, 'square', 0.12, t); tone(990, 0.1, 'square', 0.12, t + 0.07); break;
+      case 'deliver': [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.12, 'square', 0.12, t + i * 0.07)); tone(1047, 0.3, 'triangle', 0.15, t + 0.28); break;
+      case 'hit': noise(0.35, 0.3, t); tone(220, 0.35, 'sawtooth', 0.2, t, 50); break;
+      case 'shield': noise(0.2, 0.2, t); tone(900, 0.2, 'triangle', 0.15, t, 300); break;
+      case 'power': tone(440, 0.25, 'square', 0.12, t, 1760); break;
+      case 'lost': tone(400, 0.4, 'triangle', 0.2, t, 100); break;
+      case 'wave': [392, 523, 659, 784].forEach((f, i) => tone(f, 0.14, 'square', 0.12, t + i * 0.1)); break;
+      case 'over': [440, 415, 392, 370, 330].forEach((f, i) => tone(f, 0.25, 'square', 0.14, t + i * 0.22)); tone(110, 0.8, 'triangle', 0.25, t + 1.1); break;
+      case 'click': tone(880, 0.04, 'square', 0.08, t); break;
+      case 'tick': tone(1200, 0.04, 'square', 0.06, t); break;
+    }
+  }
+
+  return { unlock, music, setLevel, toggleMute, pause, sfx, get muted() { return muted; } };
+})();
+</script>
+<script>
+'use strict';
+/* ==========================================================
+   boat.js - Lancha de rescate: física, estela y dibujo
+   ========================================================== */
+
+const BOAT = {
+  ACCEL: 150,        // empuje del motor (px/s²)
+  DRAG: 1.7,         // resistencia del agua (velocidad punta ≈ ACCEL/DRAG ≈ 88 px/s)
+  GRIP: 2.6,         // "quilla": frena el deslizamiento lateral
+  TURN: 6.5,         // giro máximo (rad/s)
+  LOAD_ACCEL: 0.08,  // cada náufrago a bordo resta 8% de empuje...
+  LOAD_DRAG: 0.05,   // ...y suma 5% de resistencia (con 3: ~66% de velocidad)
+  LOAD_TURN: 0.08,   // ...y resta 8% de giro
+  MAX_LOAD: 3,
+  MIN_WAKE_SPEED: 14
+};
+
+class Boat {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
+    this.heading = 0;               // radianes, 0 = hacia la derecha
+    this.load = 0;                  // náufragos a bordo
+    this.maxLoad = BOAT.MAX_LOAD;
+    this.animT = 0; this.frame = 0; this.bobT = 0;
+    this.wake = []; this.wakeT = 0; // partículas de estela
+    this.invuln = 0;                // segundos de invulnerabilidad tras un choque
+    this.fx = { turbo: 0, magnet: 0, shield: 0 };   // power-ups activos (segundos restantes)
+  }
+
+  get speed() { return Math.hypot(this.vx, this.vy); }
+
+  /* axis: {x,y} con módulo <= 1 (teclado o joystick). bounds: límites del mar. */
+  update(dt, axis, bounds) {
+    const L = this.load;
+    if (this.invuln > 0) this.invuln = Math.max(0, this.invuln - dt);
+    for (const k in this.fx) if (this.fx[k] > 0) this.fx[k] = Math.max(0, this.fx[k] - dt);
+    let ax = axis.x, ay = axis.y, mag = Math.hypot(ax, ay);
+    if (mag > 1) { ax /= mag; ay /= mag; mag = 1; }
+
+    // 1) Empuje (menor cuanto más carga) y resistencia del agua
+    const accel = BOAT.ACCEL * (this.fx.turbo > 0 ? 1.8 : 1) * (1 - BOAT.LOAD_ACCEL * L);   // turbo: +80% de empuje
+    this.vx += ax * accel * dt;
+    this.vy += ay * accel * dt;
+    const drag = Math.exp(-BOAT.DRAG * (1 + BOAT.LOAD_DRAG * L) * dt);
+    this.vx *= drag; this.vy *= drag;
+
+    // 2) Agarre lateral: la velocidad perpendicular al casco se amortigua más
+    const fx = Math.cos(this.heading), fy = Math.sin(this.heading);
+    const fwd = this.vx * fx + this.vy * fy;
+    const grip = Math.exp(-BOAT.GRIP * dt);
+    this.vx = fwd * fx + (this.vx - fwd * fx) * grip;
+    this.vy = fwd * fy + (this.vy - fwd * fy) * grip;
+
+    // 3) Rumbo: gira hacia donde se empuja (o hacia donde se desliza)
+    const speed = this.speed;
+    let target = null;
+    if (mag > 0.15) target = Math.atan2(ay, ax);
+    else if (speed > 12) target = Math.atan2(this.vy, this.vx);
+    if (target !== null) {
+      let d = target - this.heading;
+      d = Math.atan2(Math.sin(d), Math.cos(d));
+      const turn = BOAT.TURN * (1 - BOAT.LOAD_TURN * L) * dt;
+      this.heading += Math.max(-turn, Math.min(turn, d));
+    }
+
+    // 4) Movimiento y rebote suave en los bordes del mar
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    if (this.x < bounds.minX) { this.x = bounds.minX; if (this.vx < 0) this.vx *= -0.35; }
+    if (this.x > bounds.maxX) { this.x = bounds.maxX; if (this.vx > 0) this.vx *= -0.35; }
+    if (this.y < bounds.minY) { this.y = bounds.minY; if (this.vy < 0) this.vy *= -0.35; }
+    if (this.y > bounds.maxY) { this.y = bounds.maxY; if (this.vy > 0) this.vy *= -0.35; }
+
+    // 5) Animación y estela
+    this.bobT += dt;
+    this.animT += dt * (1 + speed / 40);
+    this.frame = Math.floor(this.animT * 4) % 2;
+    this._updateWake(dt, speed);
+  }
+
+  _updateWake(dt, speed) {
+    if (speed > BOAT.MIN_WAKE_SPEED) {
+      this.wakeT -= dt;
+      while (this.wakeT <= 0 && this.wake.length < 120) {
+        this.wakeT += 0.035;
+        const c = Math.cos(this.heading), s = Math.sin(this.heading);
+        const sx = this.x - c * 8, sy = this.y - s * 8;   // popa
+        for (const side of [-1, 1]) {                      // dos líneas en "V"
+          const life = 0.55 + Math.random() * 0.4;
+          const out = side * (6 + Math.random() * 5);
+          this.wake.push({
+            x: sx - s * side * (1.5 + Math.random() * 1.5),
+            y: sy + c * side * (1.5 + Math.random() * 1.5),
+            vx: -s * out - c * 4, vy: c * out - s * 4, life, max: life
+          });
+        }
+      }
+    } else this.wakeT = 0;
+    for (const p of this.wake) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+    this.wake = this.wake.filter(p => p.life > 0);
+  }
+
+  draw(ctx) {
+    // Estela: espuma blanca que se enfría y encoge
+    for (const p of this.wake) {
+      const k = p.life / p.max;
+      const x = Math.round(p.x), y = Math.round(p.y);
+      if (k > 0.66) { ctx.fillStyle = PAL.foam2; ctx.fillRect(x, y, 2, 2); }
+      else if (k > 0.33) { ctx.fillStyle = PAL.foam1; ctx.fillRect(x, y, 2, 2); }
+      else { ctx.fillStyle = PAL.sea3; ctx.fillRect(x, y, 1, 1); }
+    }
+    const bx = Math.round(this.x), by = Math.round(this.y);
+    if (this.fx.shield > 0 && (this.fx.shield > 2 || Math.floor(this.bobT * 8) % 2 === 0)) {   // anillo del escudo
+      for (let k = 0; k < 28; k++) {
+        const a = k * Math.PI * 2 / 28 + this.bobT * 2;
+        ctx.fillStyle = k % 2 ? PAL.foam2 : PAL.foam1;
+        ctx.fillRect(Math.round(bx + Math.cos(a) * 11), Math.round(by + Math.sin(a) * 11), 1, 1);
+      }
+    }
+    if (this.fx.magnet > 0) {                                                                  // puntos giratorios del imán
+      ctx.fillStyle = PAL.pink;
+      for (let k = 0; k < 8; k++) {
+        const a = k * Math.PI / 4 - this.bobT * 3;
+        ctx.fillRect(Math.round(bx + Math.cos(a) * 15), Math.round(by + Math.sin(a) * 15), 2, 2);
+      }
+    }
+    if (this.invuln > 0 && Math.floor(this.invuln * 12) % 2 === 0) return;   // parpadeo
+    // Sprite según rumbo (16 direcciones)
+    const TAU = Math.PI * 2;
+    const dir = Math.round((((this.heading % TAU) + TAU) % TAU) / TAU * Sprites.DIRS) % Sprites.DIRS;
+    const bob = Math.round(Math.sin(this.bobT * 2.4) * 0.6);   // cabeceo de -1 a 1 px
+    const x = Math.round(this.x) - 8, y = Math.round(this.y) - 8;
+    ctx.drawImage(Sprites.boatShadow[dir], x + 2, y + 3);
+    ctx.drawImage(Sprites.boat[this.frame][dir], x, y + bob);
+  }
+}
+</script>
+<script>
+'use strict';
+/* ==========================================================
+   entities.js - Náufragos, puerto y mensajes flotantes
+   Obstáculos: rocas, boyas, remolinos, tiburones y corrientes
+   ========================================================== */
+
+/* ---------- AJUSTES DE JUEGO (la fase 3 los hará depender del nivel) ---------- */
+const CFG = {
+  startTime: 60,      // segundos iniciales
+  castawayTime: 18,   // segundos que aguanta cada náufragos
+  spawnMin: 3, spawnMax: 5,   // intervalo entre apariciones
+  maxActive: 4,       // náufragos a la vez en el mar
+  pickupRadius: 12,
+  pointsEach: 100, bonus2: 50, bonus3: 200,   // puntos por persona y bonus de combo
+  timeEach: 4, timeBonus3: 5,                 // segundos extra por persona y por combo de 3
+  lives: 3, invulnTime: 2, currentForce: 60,  // vidas, invulnerabilidad (s) y empuje de corrientes
+  waveTimeBonus: 10, waveBonus: 250,          // al superar una oleada
+  powerupLife: 12, clockBonus: 10,            // segundos en el mar y segundos del reloj
+  fx: { turbo: 5, magnet: 8, shield: 12 }     // duración de cada power-up (s)
+};
+
+/* ---------- NÁUFRAGO ---------- */
+class Castaway {
+  constructor(x, y, maxT) { this.x = x; this.y = y; this.t = maxT; this.maxT = maxT; this.animT = Math.random() * 2; }
+  get frac() { return this.t / this.maxT; }
+  update(dt) { this.t -= dt; this.animT += dt; }
+
+  draw(ctx) {
+    const f = [0, 1, 2, 1][Math.floor(this.animT * 6) % 4];     // brazos saludando
+    const bob = Math.round(Math.sin(this.animT * 3));
+    ctx.drawImage(Sprites.castaway[f], Math.round(this.x) - 4, Math.round(this.y) - 3 + bob);
+    this._ring(ctx);
+  }
+
+  // Anillo de tiempo: se vacía en sentido horario; verde > amarillo > rojo parpadeante
+  _ring(ctx) {
+    const R = 9, cx = Math.round(this.x), cy = Math.round(this.y), fr = this.frac;
+    ctx.fillStyle = PAL.deep;
+    for (let a = 0; a < Math.PI * 2; a += 0.07) ctx.fillRect(Math.round(cx + Math.cos(a) * R), Math.round(cy + Math.sin(a) * R), 1, 1);
+    if (fr < 0.25 && Math.floor(this.animT * 8) % 2 === 0) return;   // parpadeo
+    ctx.fillStyle = fr > 0.5 ? PAL.green : fr > 0.25 ? PAL.yellow : PAL.red;
+    const a0 = -Math.PI / 2;
+    for (let a = 0; a < Math.PI * 2 * fr; a += 0.07) ctx.fillRect(Math.round(cx + Math.cos(a0 + a) * R), Math.round(cy + Math.sin(a0 + a) * R), 1, 1);
+  }
+}
+
+/* ---------- TEXTO FLOTANTE (+puntos, combos, avisos) ---------- */
+class Popup {
+  constructor(x, y, str, color) { this.x = Math.max(34, Math.min(W - 34, x)); this.y = y; this.str = str; this.color = color; this.life = 1.2; }
+  update(dt) { this.life -= dt; this.y -= 14 * dt; }
+  draw(ctx) { UI.text(ctx, this.str, this.x, this.y, { align: 'center', color: this.color }); }
+}
+
+/* ---------- PUERTO: zona de entrega a la izquierda ---------- */
+const Port = {
+  zone: { x1: 44, y0: 64, y1: 116 },
+  contains(b) { return b.x < this.zone.x1 && b.y > this.zone.y0 && b.y < this.zone.y1; },
+  draw(ctx, t, active) {
+    ctx.drawImage(Sprites.port, 0, 0);
+    ctx.fillStyle = PAL.foam1;                                   // espuma en la orilla
+    for (let y = UI.HUD_H + 2; y < H; y += 2) {
+      if (y > 70 && y < 110) continue;
+      ctx.fillRect(8 + Math.round(Math.sin(y * 0.3 + t * 2) * 1.5), y, 1, 1);
+    }
+    if (active && Math.floor(t * 3) % 2 === 0) {                 // marco de entrega parpadeante
+      const z = this.zone;
+      ctx.fillStyle = PAL.yellow;
+      for (let x = 0; x <= z.x1; x += 4) { ctx.fillRect(x, z.y0, 2, 1); ctx.fillRect(x, z.y1, 2, 1); }
+      for (let y = z.y0; y <= z.y1; y += 4) ctx.fillRect(z.x1, y, 1, 2);
+    }
+    UI.text(ctx, 'PUERTO', 2, 54, { color: PAL.yellow });
+  }
+};
+
+/* ---------- ROCA: sólida, no se puede cruzar ---------- */
+class Rock {
+  constructor(x, y) { this.x = x; this.y = y; this.r = 6; }
+  draw(ctx, t) {
+    ctx.fillStyle = PAL.foam1;                                   // espuma que rodea la roca
+    for (let k = 0; k < 12; k++) {
+      const a = k * Math.PI / 6 + t * 0.6, s = Math.sin(t * 2 + k) > 0 ? 10 : 9;
+      ctx.fillRect(Math.round(this.x + Math.cos(a) * s), Math.round(this.y + 1 + Math.sin(a) * s * 0.7), 1, 1);
+    }
+    ctx.drawImage(Sprites.rock, Math.round(this.x) - 7, Math.round(this.y) - 5);
+  }
+}
+
+/* ---------- BOYA: sólida, con luz parpadeante ---------- */
+class Buoy {
+  constructor(x, y) { this.x = x; this.y = y; this.r = 4; this.p = Math.random() * 6; }
+  draw(ctx, t) {
+    const bob = Math.round(Math.sin(t * 2 + this.p));
+    ctx.drawImage(Sprites.buoy[Math.floor(t * 2 + this.p) % 2], Math.round(this.x) - 4, Math.round(this.y) - 4 + bob);
+  }
+}
+
+/* ---------- REMOLINO: atrae y hace girar; el centro hace daño ---------- */
+class Whirlpool {
+  constructor(x, y) { this.x = x; this.y = y; this.r = 5; this.pullR = 30; }
+  affect(boat, dt) {
+    const dx = this.x - boat.x, dy = this.y - boat.y, d = Math.hypot(dx, dy);
+    if (d < this.pullR && d > 0.1) {
+      const k = 1 - d / this.pullR;
+      boat.vx += (dx / d * 80 - dy / d * 45) * k * dt;           // hacia el centro + giro
+      boat.vy += (dy / d * 80 + dx / d * 45) * k * dt;
+    }
+  }
+  draw(ctx, t) { ctx.drawImage(Sprites.whirl[Math.floor(t * 8) % 4], Math.round(this.x) - 10, Math.round(this.y) - 10); }
+}
+
+/* ---------- TIBURÓN: patrulla entre puntos y persigue si te acercas ---------- */
+class Shark {
+  constructor(x, y, speed) {
+    this.x = x; this.y = y; this.speed = speed; this.r = 6;
+    this.heading = Math.random() * Math.PI * 2; this.animT = Math.random() * 4;
+    this.pick();
+  }
+  pick() { this.tx = rand(64, W - 14); this.ty = rand(UI.HUD_H + 16, H - 14); }
+  update(dt, boat) {
+    this.animT += dt;
+    let tx = this.tx, ty = this.ty, sp = this.speed;
+    if (Math.hypot(boat.x - this.x, boat.y - this.y) < 55 && boat.invuln <= 0) { tx = boat.x; ty = boat.y; sp *= 1.35; }
+    else if (Math.hypot(tx - this.x, ty - this.y) < 6) this.pick();
+    let d = Math.atan2(ty - this.y, tx - this.x) - this.heading;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    const turn = 2.2 * dt;
+    this.heading += Math.max(-turn, Math.min(turn, d));
+    this.x += Math.cos(this.heading) * sp * dt; this.y += Math.sin(this.heading) * sp * dt;
+    if (this.x < 56 || this.x > W - 8 || this.y < UI.HUD_H + 8 || this.y > H - 8) {
+      this.x = Math.max(56, Math.min(W - 8, this.x)); this.y = Math.max(UI.HUD_H + 8, Math.min(H - 8, this.y)); this.pick();
+    }
+  }
+  draw(ctx) {
+    const TAU = Math.PI * 2, c = Math.cos(this.heading), s = Math.sin(this.heading);
+    const dir = Math.round((((this.heading % TAU) + TAU) % TAU) / TAU * Sprites.DIRS) % Sprites.DIRS;
+    ctx.fillStyle = PAL.foam1;                                   // estela corta tras la cola
+    ctx.fillRect(Math.round(this.x - c * 10), Math.round(this.y - s * 10), 2, 1);
+    ctx.fillRect(Math.round(this.x - c * 13 + Math.sin(this.animT * 6)), Math.round(this.y - s * 13), 1, 1);
+    ctx.drawImage(Sprites.shark[Math.floor(this.animT * 4) % 2][dir], Math.round(this.x) - 8, Math.round(this.y) - 8);
+  }
+}
+
+/* ---------- CORRIENTE: zona rectangular que empuja la lancha ---------- */
+class Current {
+  constructor(x, y, w, h, dx, dy) { this.x = x; this.y = y; this.w = w; this.h = h; this.dx = dx; this.dy = dy; }
+  contains(b) { return b.x > this.x && b.x < this.x + this.w && b.y > this.y && b.y < this.y + this.h; }
+  affect(boat, dt) {
+    if (this.contains(boat)) { boat.vx += this.dx * CFG.currentForce * dt; boat.vy += this.dy * CFG.currentForce * dt; }
+  }
+  draw(ctx, t) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(this.x, this.y, this.w, this.h); ctx.clip();
+    ctx.globalAlpha = 0.18; ctx.fillStyle = PAL.sea3; ctx.fillRect(this.x, this.y, this.w, this.h); ctx.globalAlpha = 1;
+    ctx.fillStyle = PAL.foam1;
+    const horiz = this.dx !== 0, sgn = horiz ? this.dx : this.dy, len = horiz ? this.w : this.h;
+    const lanes = Math.floor((horiz ? this.h : this.w) / 8);
+    for (let i = 0; i < lanes; i++) {                            // rayas con punta de flecha que fluyen
+      const lane = 4 + i * 8, pos = ((t * 34 * sgn + i * 17) % len + len) % len;
+      for (const off of [0, -len]) {
+        const p = pos + off, head = sgn > 0 ? 6 : 0;
+        if (horiz) { const x = this.x + p, y = this.y + lane; ctx.fillRect(x, y, 7, 1); ctx.fillRect(x + head, y - 1, 1, 1); ctx.fillRect(x + head, y + 1, 1, 1); }
+        else { const x = this.x + lane, y = this.y + p; ctx.fillRect(x, y, 1, 7); ctx.fillRect(x - 1, y + head, 1, 1); ctx.fillRect(x + 1, y + head, 1, 1); }
+      }
+    }
+    ctx.restore();
+  }
+}
+
+/* ---------- POWER-UPS ---------- */
+const POWER_TYPES = ['turbo', 'magnet', 'shield', 'clock'];
+
+class Powerup {
+  constructor(x, y, type) { this.x = x; this.y = y; this.type = type; this.t = CFG.powerupLife; this.animT = Math.random() * 3; this.r = 8; }
+  update(dt) { this.t -= dt; this.animT += dt; }
+  draw(ctx) {
+    if (this.t < 3 && Math.floor(this.t * 6) % 2 === 0) return;      // parpadea antes de desaparecer
+    const x = Math.round(this.x), y = Math.round(this.y) + Math.round(Math.sin(this.animT * 4));
+    ctx.drawImage(Sprites.powerup[this.type], x - 6, y - 6);
+    if (Math.floor(this.animT * 3) % 2 === 0) { ctx.fillStyle = PAL.white; ctx.fillRect(x + 5, y - 6, 1, 1); ctx.fillRect(x + 4, y - 7, 3, 1); }   // destello
+  }
+}
+
+/* ---------- PARTÍCULAS PIXELADAS (salpicaduras, explosiones, chispas) ---------- */
+// o: {colors (de más caliente a más frío), speed, life, size, gravity, angle+spread (opcional)}
+const Particles = {
+  list: [],
+  emit(x, y, n, o) {
+    for (let i = 0; i < n && this.list.length < 400; i++) {
+      const a = o.angle !== undefined ? o.angle + (Math.random() - 0.5) * (o.spread || 0) : Math.random() * Math.PI * 2;
+      const sp = rand(o.speed * 0.35, o.speed), life = rand(o.life * 0.6, o.life);
+      this.list.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life, max: life, colors: o.colors, size: o.size || 2, g: o.gravity || 0 });
+    }
+  },
+  update(dt) {
+    for (const p of this.list) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.vx *= 0.97; p.vy *= 0.97; p.life -= dt; }
+    this.list = this.list.filter(p => p.life > 0);
+  },
+  draw(ctx) {
+    for (const p of this.list) {
+      const k = p.life / p.max;
+      ctx.fillStyle = p.colors[Math.min(p.colors.length - 1, Math.floor((1 - k) * p.colors.length))];
+      const sz = k < 0.3 ? 1 : p.size;
+      ctx.fillRect(Math.round(p.x), Math.round(p.y), sz, sz);
+    }
+  }
+};
+// Paletas de partículas reutilizables
+const FX_SPLASH = [PAL.foam2, PAL.foam1, PAL.sea3];
+const FX_BOOM = [PAL.cream, PAL.yellow, PAL.orange, PAL.red, PAL.grayDk];
+</script>
+<script>
+'use strict';
+/* ==========================================================
+   ui.js - Entrada (teclado + joystick flotante/arrastre), HUD y menús
+   ========================================================== */
+
+/* ---------- ENTRADA ---------- */
+const Input = (() => {
+  const held = new Set(), pressed = new Set();
+  let tapped = false, stick = null, cv = null, GW = 0, GH = 0, btn = null, tapPos = null;
+  const R = 20, DEAD = 0.18;   // radio del joystick y zona muerta
+  const BLOCK = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space']);
+
+  // Coordenadas de pantalla -> coordenadas internas 320x180
+  function toGame(e) {
+    const r = cv.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * GW / r.width, y: (e.clientY - r.top) * GH / r.height };
+  }
+
+  function init(canvas, w, h) {
+    cv = canvas; GW = w; GH = h;
+    window.addEventListener('keydown', e => {
+      if (BLOCK.has(e.code)) e.preventDefault();
+      if (!e.repeat) pressed.add(e.code);
+      held.add(e.code);
+    });
+    window.addEventListener('keyup', e => held.delete(e.code));
+    // Cualquier gesto del usuario desbloquea el audio (hasta que el contexto esté activo)
+    ['keydown', 'pointerdown', 'pointerup', 'touchend', 'click'].forEach(ev => window.addEventListener(ev, () => Audio8.unlock(), { passive: true }));
+    window.addEventListener('blur', () => { held.clear(); stick = null; });
+    cv.addEventListener('contextmenu', e => e.preventDefault());
+    cv.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      const p0 = toGame(e), b = UI.buttonAt(p0.x, p0.y);
+      if (b) { btn = b.id; return; }          // botón táctil: ni joystick ni toque normal
+      tapped = true; tapPos = p0;
+      if (stick) return;
+      cv.setPointerCapture(e.pointerId);
+      const p = toGame(e);
+      stick = { id: e.pointerId, ox: p.x, oy: p.y, x: p.x, y: p.y };
+    });
+    cv.addEventListener('pointermove', e => {
+      if (stick && e.pointerId === stick.id) { const p = toGame(e); stick.x = p.x; stick.y = p.y; }
+    });
+    const end = e => { if (stick && e.pointerId === stick.id) stick = null; };
+    cv.addEventListener('pointerup', end);
+    cv.addEventListener('pointercancel', end);
+  }
+
+  // Vector de dirección con módulo <= 1
+  function axis() {
+    if (stick) {
+      let dx = stick.x - stick.ox, dy = stick.y - stick.oy, d = Math.hypot(dx, dy);
+      if (d > R) {                       // la base sigue al dedo si se aleja
+        stick.ox += dx * (d - R) / d; stick.oy += dy * (d - R) / d;
+        dx = stick.x - stick.ox; dy = stick.y - stick.oy; d = R;
+      }
+      const m = d / R;
+      if (m < DEAD) return { x: 0, y: 0 };
+      const k = (m - DEAD) / (1 - DEAD) / d;
+      return { x: dx * k, y: dy * k };
+    }
+    let x = 0, y = 0;
+    if (held.has('ArrowLeft') || held.has('KeyA')) x -= 1;
+    if (held.has('ArrowRight') || held.has('KeyD')) x += 1;
+    if (held.has('ArrowUp') || held.has('KeyW')) y -= 1;
+    if (held.has('ArrowDown') || held.has('KeyS')) y += 1;
+    return { x, y };
+  }
+
+  // Dibuja el joystick virtual con píxeles
+  function drawStick(ctx) {
+    if (!stick) return;
+    ctx.fillStyle = PAL.foam1;
+    for (let a = 0; a < Math.PI * 2; a += 0.1) {
+      ctx.fillRect(Math.round(stick.ox + Math.cos(a) * R), Math.round(stick.oy + Math.sin(a) * R), 1, 1);
+    }
+    let dx = stick.x - stick.ox, dy = stick.y - stick.oy;
+    const d = Math.hypot(dx, dy);
+    if (d > R) { dx *= R / d; dy *= R / d; }
+    const kx = Math.round(stick.ox + dx), ky = Math.round(stick.oy + dy);
+    ctx.fillStyle = PAL.ink; ctx.fillRect(kx - 3, ky - 3, 7, 7);
+    ctx.fillStyle = PAL.yellow; ctx.fillRect(kx - 2, ky - 2, 5, 5);
+  }
+
+  return {
+    init, axis, drawStick,
+    wasPressed: code => pressed.has(code),
+    startPressed: () => tapped || pressed.has('Space') || pressed.has('Enter'),
+    takeTap() { const p = tapPos; tapPos = null; return p; },
+    takeButton() { const b = btn; btn = null; return b; },
+    endFrame() { pressed.clear(); tapped = false; tapPos = null; btn = null; },
+    reset() { pressed.clear(); tapped = false; tapPos = null; btn = null; stick = null; }
+  };
+})();
+
+/* ---------- INTERFAZ ---------- */
+const UI = (() => {
+  const FONT = '"Press Start 2P", "Courier New", monospace';
+  const HUD_H = 12;
+
+  // Texto pixel con sombra. size 8 o 16 (múltiplos de 8 mantienen los píxeles nítidos)
+  function text(ctx, str, x, y, o = {}) {
+    const size = o.size || 8, off = size >= 16 ? 2 : 1;
+    ctx.font = size + 'px ' + FONT;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = o.align || 'left';
+    if (o.shadow !== null) {
+      ctx.fillStyle = o.shadow || PAL.ink;
+      ctx.fillText(str, Math.round(x) + off, Math.round(y) + off);
+    }
+    ctx.fillStyle = o.color || PAL.cream;
+    ctx.fillText(str, Math.round(x), Math.round(y));
+  }
+
+  // HUD superior: puntos, tiempo, oleada, carga y vidas
+  function drawHUD(ctx, W, g) {
+    ctx.fillStyle = PAL.ink; ctx.fillRect(0, 0, W, HUD_H);
+    ctx.fillStyle = PAL.deep; ctx.fillRect(0, HUD_H, W, 1);
+    text(ctx, 'PTS ' + String(g.score).padStart(6, '0'), 4, 2, { shadow: null, color: PAL.yellow });
+    const low = g.timeLeft < 10 && Math.floor(g.timeLeft * 4) % 2 === 0;
+    text(ctx, 'TIEMPO ' + Math.ceil(g.timeLeft), 88, 2, { shadow: null, color: low ? PAL.red : PAL.cream });
+    text(ctx, 'NV' + g.level, 166, 2, { shadow: null, color: PAL.foam1 });
+    text(ctx, 'CARGA', 200, 2, { shadow: null });
+    for (let i = 0; i < g.maxLoad; i++) {
+      const x = 246 + i * 12;
+      ctx.fillStyle = PAL.gray; ctx.fillRect(x, 2, 9, 8);
+      ctx.fillStyle = PAL.ink; ctx.fillRect(x + 1, 3, 7, 6);
+      if (i < g.load) { ctx.fillStyle = PAL.orange; ctx.fillRect(x + 1, 3, 7, 6); ctx.fillStyle = PAL.skin; ctx.fillRect(x + 3, 4, 3, 2); }
+    }
+    for (let i = 0; i < CFG.lives; i++) ctx.drawImage(Sprites.heart[i < g.lives ? 0 : 1], 288 + i * 10, 3);
+  }
+
+  // Power-ups activos: icono con barra de tiempo restante bajo el HUD
+  function drawFx(ctx, boat) {
+    let i = 0;
+    for (const k of ['turbo', 'magnet', 'shield']) {
+      if (boat.fx[k] <= 0) continue;
+      const x = 4 + i * 16, y = 16;
+      ctx.drawImage(Sprites.powerup[k], x, y);
+      ctx.fillStyle = PAL.ink; ctx.fillRect(x, y + 14, 13, 2);
+      ctx.fillStyle = PAL.yellow; ctx.fillRect(x, y + 14, Math.ceil(13 * boat.fx[k] / CFG.fx[k]), 2);
+      i++;
+    }
+  }
+
+  // Cartel central al empezar cada oleada
+  function drawBanner(ctx, W, b) {
+    text(ctx, b.title, W / 2, 70, { size: 16, align: 'center', color: PAL.yellow });
+    text(ctx, b.sub, W / 2, 92, { align: 'center', color: PAL.foam2 });
+  }
+
+  function drawHint(ctx, W, H) {
+    text(ctx, 'RECOGE NÁUFRAGOS Y LLÉVALOS AL PUERTO', W / 2, H - 10, { align: 'center' });
+  }
+
+  /* ----- Menú principal ----- */
+  const ITEMS = ['JUGAR', 'CÓMO JUGAR', 'RÉCORDS'];
+  const itemY = i => 98 + i * 14;
+  const inBox = (x, y, cx, cy, hw, top, bot) => Math.abs(x - cx) < hw && y >= cy - top && y < cy + bot;
+  const menuItemAt = (x, y) => ITEMS.findIndex((_, i) => inBox(x, y, W / 2, itemY(i), 70, 3, 11));
+
+  function drawTitle(ctx, W, H, t, sel) {
+    text(ctx, 'RESCATE', W / 2, 36, { size: 16, align: 'center', color: PAL.yellow });
+    text(ctx, 'EN ALTA MAR', W / 2, 58, { size: 16, align: 'center', color: PAL.foam2 });
+    ITEMS.forEach((s, i) => {
+      const on = i === sel;
+      text(ctx, s, W / 2, itemY(i), { align: 'center', color: on ? PAL.yellow : PAL.foam2 });
+      if (on && Math.floor(t * 3) % 2 === 0) { text(ctx, '>', W / 2 - 64, itemY(i), { color: PAL.orange }); text(ctx, '<', W / 2 + 56, itemY(i), { color: PAL.orange }); }
+    });
+    text(ctx, 'C CRT   M SONIDO   P PAUSA', W / 2, H - 10, { align: 'center', color: PAL.foam1 });
+  }
+
+  /* ----- Cómo jugar ----- */
+  function drawHelp(ctx, W, H, t) {
+    ctx.fillStyle = PAL.ink; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = PAL.deep; ctx.fillRect(0, 26, W, 1);
+    text(ctx, 'CÓMO JUGAR', W / 2, 6, { size: 16, align: 'center', color: PAL.yellow });
+    ['MUEVE: FLECHAS/WASD O ARRASTRA', 'RECOGE NÁUFRAGOS (MÁXIMO 3)', 'LLÉVALOS AL PUERTO DE LA IZQUIERDA',
+     'EVITA ROCAS, REMOLINOS Y TIBURONES', 'COMBO DE 3 = BONUS DE PUNTOS Y TIEMPO', 'TIENES 3 VIDAS. NO TE QUEDES SIN TIEMPO']
+      .forEach((s, i) => text(ctx, s, W / 2, 36 + i * 11, { align: 'center', shadow: null }));
+    [['turbo', 'TURBO'], ['magnet', 'IMÁN'], ['shield', 'ESCUDO'], ['clock', 'RELOJ']].forEach(([k, n], i) => {
+      const cx = 52 + i * 72;
+      ctx.drawImage(Sprites.powerup[k], cx - 6, 112);
+      text(ctx, n, cx, 129, { align: 'center', shadow: null, color: PAL.foam2 });
+    });
+    text(ctx, 'C CRT  M SONIDO  P PAUSA  ESC MENÚ', W / 2, 148, { align: 'center', shadow: null, color: PAL.foam1 });
+    if (Math.floor(t * 2) % 2 === 0) text(ctx, 'PULSA PARA VOLVER', W / 2, 164, { align: 'center', color: PAL.orange });
+  }
+
+  /* ----- Tabla de récords (en memoria) ----- */
+  function drawTable(ctx, W, y0, recs, hi, t) {
+    for (let i = 0; i < 5; i++) {
+      const r = recs[i], y = y0 + i * 10;
+      const s = r ? (i + 1) + '. ' + r.n + ' ' + String(r.s).padStart(6, '0') + ' NV' + r.l : (i + 1) + '. ---';
+      const blink = r && r === hi && Math.floor(t * 4) % 2 === 0;
+      text(ctx, s, W / 2, y, { align: 'center', shadow: null, color: blink ? PAL.orange : r === hi ? PAL.yellow : i === 0 ? PAL.yellow : PAL.cream });
+    }
+  }
+
+  function drawRecords(ctx, W, H, recs, t) {
+    ctx.fillStyle = PAL.ink; ctx.fillRect(0, 0, W, H);
+    text(ctx, 'RÉCORDS', W / 2, 20, { size: 16, align: 'center', color: PAL.yellow });
+    drawTable(ctx, W, 62, recs, null, t);
+    text(ctx, 'SE GUARDAN MIENTRAS NO CIERRES LA PÁGINA', W / 2, 130, { align: 'center', shadow: null, color: PAL.foam1 });
+    if (Math.floor(t * 2) % 2 === 0) text(ctx, 'PULSA PARA VOLVER', W / 2, 160, { align: 'center', color: PAL.orange });
+  }
+
+  /* ----- Fin de partida ----- */
+  const END_Y = [138, 150];
+  const endAt = (x, y) => inBox(x, y, W / 2, END_Y[0], 70, 3, 9) ? 'retry' : inBox(x, y, W / 2, END_Y[1], 70, 3, 9) ? 'menu' : null;
+
+  function panel(ctx, W) {
+    ctx.fillStyle = PAL.ink; ctx.fillRect(40, 12, W - 80, 156);
+    ctx.fillStyle = PAL.gray; ctx.fillRect(40, 12, W - 80, 1); ctx.fillRect(40, 167, W - 80, 1);
+  }
+
+  function drawEnd(ctx, W, H, g, t, recs, hi) {
+    panel(ctx, W);
+    text(ctx, g.reason, W / 2, 22, { size: 16, align: 'center', color: PAL.red });
+    text(ctx, 'PUNTOS ' + String(g.score).padStart(6, '0'), W / 2, 44, { align: 'center', color: PAL.yellow });
+    text(ctx, 'OLEADA ' + g.level + '  RESCATADOS ' + g.rescued, W / 2, 55, { align: 'center' });
+    text(ctx, 'RÉCORDS', W / 2, 69, { align: 'center', color: PAL.foam1, shadow: null });
+    drawTable(ctx, W, 80, recs, hi, t);
+    if (g.endT > 1) {
+      text(ctx, 'JUGAR DE NUEVO', W / 2, END_Y[0], { align: 'center', color: Math.floor(t * 2) % 2 ? PAL.orange : PAL.yellow });
+      text(ctx, 'MENÚ', W / 2, END_Y[1], { align: 'center', color: PAL.foam2 });
+    }
+  }
+
+  /* ----- Nuevo récord: 3 letras (teclado o toque en cada letra) ----- */
+  const slotX = i => W / 2 + (i - 1) * 28;
+  const entryAt = (x, y) => {
+    if (inBox(x, y, W / 2, 128, 40, 3, 11)) return 'ok';
+    for (let i = 0; i < 3; i++) if (inBox(x, y, slotX(i), 92, 13, 0, 22)) return i;
+    return null;
+  };
+
+  function drawEntry(ctx, W, H, g, e, t) {
+    panel(ctx, W);
+    text(ctx, 'NUEVO RÉCORD', W / 2, 24, { size: 16, align: 'center', color: PAL.yellow });
+    text(ctx, 'PUNTOS ' + String(g.score).padStart(6, '0'), W / 2, 54, { align: 'center' });
+    text(ctx, 'TU NOMBRE:', W / 2, 74, { align: 'center', color: PAL.foam1, shadow: null });
+    for (let i = 0; i < 3; i++) {
+      text(ctx, e.c[i], slotX(i), 92, { size: 16, align: 'center', color: i === e.pos ? PAL.orange : PAL.cream });
+      ctx.fillStyle = i === e.pos && Math.floor(t * 3) % 2 === 0 ? PAL.orange : PAL.gray;
+      ctx.fillRect(slotX(i) - 8, 111, 16, 2);
+    }
+    text(ctx, 'LETRAS O FLECHAS', W / 2, 116 + 0, { align: 'center', shadow: null, color: PAL.gray });
+    text(ctx, 'ACEPTAR (ENTER)', W / 2, 128, { align: 'center', color: Math.floor(t * 2) % 2 ? PAL.orange : PAL.yellow });
+    text(ctx, 'TOCA UNA LETRA PARA CAMBIARLA', W / 2, 146, { align: 'center', shadow: null, color: PAL.foam1 });
+  }
+
+  /* ----- Pausa ----- */
+  const PAUSE_Y = [84, 98];
+  const pauseAt = (x, y) => inBox(x, y, W / 2, PAUSE_Y[0], 70, 3, 11) ? 'resume' : inBox(x, y, W / 2, PAUSE_Y[1], 70, 3, 11) ? 'exit' : null;
+
+  function drawPause(ctx, W, H) {
+    ctx.fillStyle = PAL.ink; ctx.fillRect(60, 48, W - 120, 68);
+    ctx.fillStyle = PAL.gray; ctx.fillRect(60, 48, W - 120, 1); ctx.fillRect(60, 115, W - 120, 1);
+    text(ctx, 'PAUSA', W / 2, 56, { size: 16, align: 'center', color: PAL.yellow });
+    text(ctx, 'SEGUIR', W / 2, PAUSE_Y[0], { align: 'center', color: PAL.orange });
+    text(ctx, 'SALIR AL MENÚ', W / 2, PAUSE_Y[1], { align: 'center', color: PAL.foam2 });
+  }
+
+  /* ----- Botones táctiles (esquina superior derecha): pausa, CRT y sonido ----- */
+  const buttons = [{ id: 'pause', x: 276, y: 15 }, { id: 'crt', x: 290, y: 15 }, { id: 'sound', x: 304, y: 15 }];
+  function buttonAt(x, y) {
+    return buttons.find(b => b.on && x >= b.x - 3 && x < b.x + 16 && y >= b.y - 3 && y < b.y + 16) || null;
+  }
+
+  function drawButtons(ctx, st, muted, crtOn) {
+    for (const b of buttons) {
+      b.on = b.id !== 'pause' || st === 'playing';
+      if (!b.on) continue;
+      ctx.fillStyle = PAL.gray; ctx.fillRect(b.x, b.y, 13, 13);
+      ctx.fillStyle = PAL.ink; ctx.fillRect(b.x + 1, b.y + 1, 11, 11);
+      ctx.fillStyle = PAL.cream;
+      if (b.id === 'pause') { ctx.fillRect(b.x + 4, b.y + 3, 2, 7); ctx.fillRect(b.x + 8, b.y + 3, 2, 7); }
+      else if (b.id === 'crt') { ctx.fillStyle = crtOn ? PAL.yellow : PAL.cream; ctx.fillRect(b.x + 3, b.y + 3, 7, 5); ctx.fillStyle = PAL.ink; ctx.fillRect(b.x + 4, b.y + 4, 5, 3); ctx.fillStyle = crtOn ? PAL.yellow : PAL.cream; ctx.fillRect(b.x + 5, b.y + 9, 3, 1); }
+      else {
+        ctx.fillRect(b.x + 2, b.y + 5, 3, 3); ctx.fillRect(b.x + 5, b.y + 4, 1, 5); ctx.fillRect(b.x + 6, b.y + 3, 1, 7);
+        if (!muted) { ctx.fillRect(b.x + 8, b.y + 5, 1, 3); ctx.fillRect(b.x + 10, b.y + 4, 1, 5); }
+        else { ctx.fillStyle = PAL.red; for (let k = 0; k < 5; k++) { ctx.fillRect(b.x + 7 + k - 1, b.y + 4 + k, 1, 1); ctx.fillRect(b.x + 7 + k - 1, b.y + 8 - k, 1, 1); } }
+      }
+    }
+  }
+
+  return { text, drawHUD, drawHint, drawTitle, drawHelp, drawRecords, drawEnd, drawEntry, drawPause, drawButtons, drawBanner, drawFx,
+           menuItemAt, endAt, entryAt, pauseAt, buttonAt, HUD_H };
+})();
+</script>
+<script>
+'use strict';
+/* ==========================================================
+   main.js - Arranque, bucle de juego, estados, oleadas y colisiones
+   ========================================================== */
+
+/* ---------- CONFIGURACIÓN ---------- */
+const W = 320, H = 180;                       // resolución interna
+const STATE = { MENU: 'menu', PLAYING: 'playing', ENTRY: 'entry', END: 'end' };
+const STEP = 1 / 60;                          // paso fijo de la simulación
+const BOUNDS = { minX: 10, maxX: W - 10, minY: UI.HUD_H + 8, maxY: H - 10 };
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+let state = STATE.MENU;
+let time = 0;
+let boat = null;
+let g = { score: 0, timeLeft: 0, load: 0, maxLoad: 3, rescued: 0, lost: 0, endT: 0, lives: 3, level: 1, waveRescued: 0, goal: 5, reason: '' };
+let castaways = [], popups = [], rocks = [], buoys = [], whirls = [], sharks = [], currents = [];
+let spawnT = 0, playT = 0, fullCd = 0, banner = null, puT = 0, shake = 0;
+let powerups = [];
+// Menús, pausa, CRT y récords (los récords viven en memoria: sin localStorage)
+let menuScreen = 'main', menuSel = 0, paused = false, crtOn = false, lastSec = 0, newRec = null;
+let records = [{ n: 'CAP', s: 2000, l: 5 }, { n: 'ANA', s: 1200, l: 3 }, { n: 'PEZ', s: 600, l: 2 }];
+let entry = { c: ['A', 'A', 'A'], pos: 0 };
+
+const rand = (a, b) => a + Math.random() * (b - a);
+
+/* ---------- ESCALADO PIXELADO ---------- */
+function resize() {
+  const s0 = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const s = s0 >= 2 ? Math.floor(s0) : s0;
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  document.documentElement.style.setProperty('--s', s + 'px');   // tamaño de un píxel de juego (scanlines CRT)
+}
+
+/* ---------- DIFICULTAD POR OLEADAS ---------- */
+// Cada nivel: más obstáculos, tiburones más rápidos y menos tiempo por náufrago
+function levelParams(L) {
+  return {
+    castawayTime: Math.max(8, CFG.castawayTime - (L - 1) * 1.5),
+    spawnMin: Math.max(1.5, CFG.spawnMin - (L - 1) * 0.25),
+    spawnMax: Math.max(2.5, CFG.spawnMax - (L - 1) * 0.3),
+    rocks: Math.min(9, 2 + L), buoys: Math.min(6, 1 + L),
+    whirls: L < 2 ? 0 : Math.min(4, L - 1),
+    sharks: L < 2 ? 0 : Math.min(4, Math.ceil((L - 1) / 1.5)),
+    sharkSpeed: Math.min(48, 26 + L * 2.5),
+    currents: L < 3 ? 0 : Math.min(3, L - 2)
+  };
+}
+
+const allObjs = () => [].concat(castaways, rocks, buoys, whirls, sharks);
+const occupied = (x, y, d) => allObjs().some(o => Math.hypot(x - o.x, y - o.y) < d);
+
+// Busca un punto libre del mar, lejos de la lancha y de otros objetos
+function place(dBoat, dOthers) {
+  for (let i = 0; i < 40; i++) {
+    const x = rand(64, W - 16), y = rand(UI.HUD_H + 18, H - 16);
+    if (Math.hypot(x - boat.x, y - boat.y) >= dBoat && !occupied(x, y, dOthers)) return { x, y };
+  }
+  return null;
+}
+
+function buildObstacles() {
+  const p = levelParams(g.level);
+  rocks = []; buoys = []; whirls = []; sharks = []; currents = [];
+  for (let i = 0; i < p.rocks; i++) { const s = place(50, 28); if (s) rocks.push(new Rock(s.x, s.y)); }
+  for (let i = 0; i < p.whirls; i++) { const s = place(60, 42); if (s) whirls.push(new Whirlpool(s.x, s.y)); }
+  for (let i = 0; i < p.buoys; i++) { const s = place(40, 24); if (s) buoys.push(new Buoy(s.x, s.y)); }
+  for (let i = 0; i < p.sharks; i++) { const s = place(90, 50); if (s) sharks.push(new Shark(s.x, s.y, p.sharkSpeed)); }
+  for (let i = 0; i < p.currents; i++) {
+    const horiz = Math.random() < 0.5, w = horiz ? 72 : 36, h = horiz ? 36 : 72, sg = Math.random() < 0.5 ? -1 : 1;
+    const c = new Current(rand(60, W - w - 6), rand(UI.HUD_H + 14, H - h - 8), w, h, horiz ? sg : 0, horiz ? 0 : sg);
+    if (!c.contains(boat)) currents.push(c);
+  }
+}
+
+/* ---------- ESTADOS ---------- */
+function toMenu() {
+  state = STATE.MENU;
+  boat = new Boat(W / 2 + 115, H / 2 + 10);
+  castaways = []; popups = []; rocks = []; buoys = []; whirls = []; sharks = []; currents = []; banner = null;
+  powerups = []; Particles.list = []; shake = 0;
+  menuScreen = 'main'; paused = false; Audio8.pause(false); Audio8.music(true); Audio8.setLevel(1);
+  Input.reset();
+}
+
+function startGame() {
+  state = STATE.PLAYING;
+  boat = new Boat(W / 2, H / 2);
+  g = { score: 0, timeLeft: CFG.startTime, load: 0, maxLoad: boat.maxLoad, rescued: 0, lost: 0, endT: 0,
+        lives: CFG.lives, level: 1, waveRescued: 0, goal: 5, reason: '' };
+  castaways = []; popups = []; playT = 0; fullCd = 0;
+  powerups = []; Particles.list = []; shake = 0; puT = rand(10, 16);
+  paused = false; lastSec = 0; newRec = null; Audio8.pause(false); Audio8.music(true); Audio8.setLevel(1);
+  const p = levelParams(1);
+  spawnT = rand(p.spawnMin, p.spawnMax);
+  buildObstacles();
+  spawnCastaway(); spawnCastaway();
+  banner = { t: 2, title: 'OLEADA 1', sub: 'RESCATA ' + g.goal + ' NÁUFRAGOS' };
+  Input.reset();
+}
+
+// Fin de partida: si la puntuación entra en el top 5 se pide el nombre
+function endGame(reason) {
+  g.reason = reason; g.endT = 0; newRec = null;
+  Audio8.music(false); Audio8.sfx('over'); Input.reset();
+  entry = { c: ['A', 'A', 'A'], pos: 0 };
+  const q = g.score > 0 && (records.length < 5 || g.score > records[records.length - 1].s);
+  state = q ? STATE.ENTRY : STATE.END;
+}
+
+function confirmEntry() {
+  newRec = { n: entry.c.join(''), s: g.score, l: g.level };
+  records.push(newRec);
+  records.sort((a, b) => b.s - a.s);
+  records = records.slice(0, 5);
+  Audio8.sfx('wave');
+  state = STATE.END; g.endT = 0; Input.reset();
+}
+
+/* ---------- NÁUFRAGOS, ENTREGA Y OLEADAS ---------- */
+function spawnCastaway() {
+  for (let i = 0; i < 30; i++) {
+    const x = rand(60, W - 14), y = rand(UI.HUD_H + 16, H - 14);
+    if (Math.hypot(x - boat.x, y - boat.y) < 45 || occupied(x, y, 26)) continue;
+    castaways.push(new Castaway(x, y, levelParams(g.level).castawayTime));
+    return;
+  }
+}
+
+function deliver() {
+  const n = boat.load;
+  const bonus = n === 3 ? CFG.bonus3 : n === 2 ? CFG.bonus2 : 0;
+  const pts = n * CFG.pointsEach + bonus;
+  const secs = n * CFG.timeEach + (n === 3 ? CFG.timeBonus3 : 0);
+  g.score += pts; g.timeLeft += secs; g.rescued += n; g.waveRescued += n;
+  popups.push(new Popup(boat.x + 20, boat.y - 10, '+' + pts, PAL.yellow));
+  popups.push(new Popup(boat.x + 20, boat.y + 2, '+' + secs + ' SEG', PAL.foam2));
+  if (n >= 2) popups.push(new Popup(boat.x + 20, boat.y - 22, n === 3 ? '¡COMBO x3!' : 'COMBO x2', PAL.orange));
+  boat.load = 0;
+  Particles.emit(boat.x, boat.y, 16, { colors: [PAL.white, PAL.yellow, PAL.orange, PAL.pink], speed: 70, life: 0.7, gravity: 40 });
+  Audio8.sfx('deliver');
+  if (g.waveRescued >= g.goal) nextWave();
+}
+
+function nextWave() {
+  g.level++; g.waveRescued = 0; g.goal = Math.min(10, 4 + g.level);
+  g.timeLeft += CFG.waveTimeBonus; g.score += CFG.waveBonus * (g.level - 1);
+  buildObstacles();
+  Audio8.sfx('wave'); Audio8.setLevel(g.level);
+  banner = { t: 2.4, title: 'OLEADA ' + g.level, sub: '+' + CFG.waveTimeBonus + ' SEG  RESCATA ' + g.goal };
+}
+
+/* ---------- COLISIONES Y VIDAS ---------- */
+function hurt(nx, ny) {
+  boat.vx += nx * 110; boat.vy += ny * 110;
+  if (boat.fx.shield > 0) {                                      // el escudo absorbe el golpe
+    boat.fx.shield = 0; boat.invuln = 1; Audio8.sfx('shield');
+    Particles.emit(boat.x, boat.y, 20, { colors: [PAL.white, PAL.foam2, PAL.foam1, PAL.sea3], speed: 80, life: 0.5 });
+    popups.push(new Popup(boat.x, boat.y - 14, 'ESCUDO ROTO', PAL.foam1));
+    shake = Math.max(shake, 2);
+    return;
+  }
+  g.lives--;
+  boat.invuln = CFG.invulnTime;
+  Particles.emit(boat.x, boat.y, 26, { colors: FX_BOOM, speed: 90, life: 0.7, gravity: 30 });
+  shake = 5; Audio8.sfx('hit');
+  popups.push(new Popup(boat.x, boat.y - 14, '¡CHOQUE!', PAL.red));
+  if (g.lives <= 0) endGame('SIN VIDAS');
+}
+
+// Power-up recogido: efecto, aviso y chispas del color de la insignia
+function applyPower(u) {
+  const col = { turbo: PAL.yellow, magnet: PAL.pink, shield: PAL.foam1, clock: PAL.green }[u.type];
+  const label = { turbo: 'TURBO', magnet: 'IMÁN', shield: 'ESCUDO', clock: '+' + CFG.clockBonus + ' SEG' }[u.type];
+  if (u.type === 'clock') g.timeLeft += CFG.clockBonus; else boat.fx[u.type] = CFG.fx[u.type];
+  popups.push(new Popup(u.x, u.y - 12, label, col));
+  Audio8.sfx('power');
+  Particles.emit(u.x, u.y, 14, { colors: [PAL.white, col, col, PAL.sea3], speed: 60, life: 0.5 });
+}
+
+function collisions() {
+  // Rocas y boyas: sólidas (rebotan siempre); hacen daño si no hay invulnerabilidad
+  for (const o of rocks.concat(buoys)) {
+    const dx = boat.x - o.x, dy = boat.y - o.y, d = Math.hypot(dx, dy) || 0.01, min = o.r + 5;
+    if (d >= min) continue;
+    const nx = dx / d, ny = dy / d, dot = boat.vx * nx + boat.vy * ny;
+    boat.x = o.x + nx * min; boat.y = o.y + ny * min;
+    if (dot < 0) { boat.vx -= 1.6 * dot * nx; boat.vy -= 1.6 * dot * ny; }
+    if (boat.invuln <= 0) hurt(nx, ny);
+  }
+  if (boat.invuln > 0) return;
+  for (const s of sharks) {                                      // tiburones
+    const d = Math.hypot(boat.x - s.x, boat.y - s.y);
+    if (d < 11) { hurt((boat.x - s.x) / (d || 1), (boat.y - s.y) / (d || 1)); return; }
+  }
+  for (const w of whirls) {                                      // centro de remolino
+    const d = Math.hypot(boat.x - w.x, boat.y - w.y);
+    if (d < w.r + 2) { hurt((boat.x - w.x) / (d || 1), (boat.y - w.y) / (d || 1)); return; }
+  }
+}
+
+/* ---------- ACTUALIZACIÓN ---------- */
+function updatePlaying(dt) {
+  playT += dt; fullCd -= dt; g.timeLeft -= dt;
+  const sec = Math.ceil(g.timeLeft);                           // pitido en los últimos 10 segundos
+  if (sec !== lastSec && sec <= 10 && sec > 0) Audio8.sfx('tick');
+  lastSec = sec;
+  if (banner) { banner.t -= dt; if (banner.t <= 0) banner = null; }
+
+  for (const w of whirls) w.affect(boat, dt);                    // fuerzas del mar
+  for (const c of currents) c.affect(boat, dt);
+  boat.update(dt, Input.axis(), BOUNDS);
+  for (const s of sharks) s.update(dt, boat);
+  collisions();
+  if (state !== STATE.PLAYING) return;
+
+  puT -= dt;                                                     // aparición ocasional de power-ups
+  if (puT <= 0 && powerups.length === 0) {
+    const s = place(40, 28);
+    if (s) powerups.push(new Powerup(s.x, s.y, POWER_TYPES[Math.floor(Math.random() * POWER_TYPES.length)]));
+    puT = rand(14, 22) + CFG.powerupLife;
+  }
+  for (const u of powerups) u.update(dt);
+  powerups = powerups.filter(u => {
+    if (Math.hypot(u.x - boat.x, u.y - boat.y) < u.r + 4) { applyPower(u); return false; }
+    return u.t > 0;
+  });
+  if (boat.fx.turbo > 0 && boat.speed > 20 && Math.random() < 0.8) {   // llamas del turbo
+    const a = boat.heading + Math.PI;
+    Particles.emit(boat.x + Math.cos(a) * 9, boat.y + Math.sin(a) * 9, 1,
+      { colors: [PAL.yellow, PAL.orange, PAL.red, PAL.grayDk], speed: 40, life: 0.35, size: 2, angle: a, spread: 0.5 });
+  }
+
+  const p = levelParams(g.level);
+  spawnT -= dt;
+  if (spawnT <= 0) {
+    if (castaways.length < CFG.maxActive) spawnCastaway();
+    spawnT = rand(p.spawnMin, p.spawnMax);
+  }
+
+  if (boat.fx.magnet > 0) for (const c of castaways) {            // el imán atrae a los náufragos cercanos
+    const dx = boat.x - c.x, dy = boat.y - c.y, d = Math.hypot(dx, dy);
+    if (d < 80 && d > 1) { c.x += dx / d * 45 * dt; c.y += dy / d * 45 * dt; }
+  }
+  for (const c of castaways) c.update(dt);
+  castaways = castaways.filter(c => {
+    if (Math.hypot(c.x - boat.x, c.y - boat.y) < CFG.pickupRadius) {
+      if (boat.load < boat.maxLoad) {
+        boat.load++;
+        popups.push(new Popup(c.x, c.y - 12, boat.load + '/' + boat.maxLoad, PAL.skin));
+        Particles.emit(c.x, c.y, 10, { colors: FX_SPLASH, speed: 50, life: 0.6, gravity: 60 });
+        Audio8.sfx('pickup');
+        return false;
+      }
+      if (fullCd <= 0) { popups.push(new Popup(boat.x, boat.y - 14, 'LLENO', PAL.red)); fullCd = 1; }
+    }
+    if (c.t <= 0) { g.lost++; popups.push(new Popup(c.x, c.y - 12, '¡PERDIDO!', PAL.red));
+      Particles.emit(c.x, c.y, 12, { colors: FX_SPLASH, speed: 45, life: 0.8, gravity: 50 });
+      Audio8.sfx('lost'); return false; }
+    return true;
+  });
+
+  if (boat.load > 0 && Port.contains(boat)) deliver();
+  g.load = boat.load;
+
+  if (g.timeLeft <= 0) { g.timeLeft = 0; endGame('TIEMPO AGOTADO'); }
+  if (Input.wasPressed('Escape')) toMenu();
+}
+
+function setPause(p) { paused = p; Audio8.pause(p); }
+
+// Botones (táctiles o de teclado): sonido, CRT y pausa
+function doButton(id) {
+  if (id === 'sound') Audio8.toggleMute();
+  else if (id === 'crt') { crtOn = !crtOn; document.getElementById('crt').classList.toggle('on', crtOn); }
+  else if (id === 'pause') { if (state !== STATE.PLAYING) return; setPause(!paused); }
+  Audio8.sfx('click');
+}
+
+function updatePaused() {
+  const tap = Input.takeTap(), hit = tap ? UI.pauseAt(tap.x, tap.y) : null;
+  if (Input.wasPressed('Escape') || hit === 'exit') { setPause(false); toMenu(); }
+  else if (hit === 'resume' || Input.wasPressed('Space') || Input.wasPressed('Enter')) setPause(false);
+}
+
+function updateMenu(dt) {
+  // Piloto automático: la lancha recorre una elipse alrededor del título
+  const a = time * 0.45;
+  const dx = W / 2 + Math.cos(a) * 115 - boat.x, dy = H / 2 + 10 + Math.sin(a) * 48 - boat.y;
+  const d = Math.hypot(dx, dy) || 1, mm = Math.min(1, d / 25) * 0.9;
+  boat.update(dt, { x: dx / d * mm, y: dy / d * mm }, BOUNDS);
+
+  const tap = Input.takeTap();
+  if (menuScreen !== 'main') {                                   // cómo jugar / récords: cualquier acción vuelve
+    if (tap || Input.wasPressed('Space') || Input.wasPressed('Enter') || Input.wasPressed('Escape')) { menuScreen = 'main'; Audio8.sfx('click'); }
+    return;
+  }
+  if (Input.wasPressed('ArrowUp') || Input.wasPressed('KeyW')) { menuSel = (menuSel + 2) % 3; Audio8.sfx('click'); }
+  if (Input.wasPressed('ArrowDown') || Input.wasPressed('KeyS')) { menuSel = (menuSel + 1) % 3; Audio8.sfx('click'); }
+  let go = Input.wasPressed('Space') || Input.wasPressed('Enter');
+  if (tap) { const k = UI.menuItemAt(tap.x, tap.y); if (k >= 0) { menuSel = k; go = true; } }
+  if (go) {
+    Audio8.sfx('click');
+    if (menuSel === 0) startGame(); else menuScreen = menuSel === 1 ? 'help' : 'records';
+  }
+}
+
+function updateEntry(dt) {
+  boat.update(dt, { x: 0, y: 0 }, BOUNDS);
+  g.endT += dt;
+  const tap = Input.takeTap();
+  if (g.endT < 0.6) return;                                      // evita pulsaciones accidentales
+  const LET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', cyc = (c, s) => LET[(LET.indexOf(c) + s + 26) % 26];
+  for (const ch of LET) if (Input.wasPressed('Key' + ch)) { entry.c[entry.pos] = ch; entry.pos = Math.min(2, entry.pos + 1); Audio8.sfx('click'); }
+  if (Input.wasPressed('ArrowUp')) entry.c[entry.pos] = cyc(entry.c[entry.pos], 1);
+  if (Input.wasPressed('ArrowDown')) entry.c[entry.pos] = cyc(entry.c[entry.pos], -1);
+  if (Input.wasPressed('ArrowLeft') || Input.wasPressed('Backspace')) entry.pos = Math.max(0, entry.pos - 1);
+  if (Input.wasPressed('ArrowRight')) entry.pos = Math.min(2, entry.pos + 1);
+  let ok = Input.wasPressed('Enter') || Input.wasPressed('Space');
+  if (tap) {
+    const h = UI.entryAt(tap.x, tap.y);
+    if (h === 'ok') ok = true;
+    else if (h !== null) { entry.pos = h; entry.c[h] = cyc(entry.c[h], 1); Audio8.sfx('click'); }
+  }
+  if (ok) confirmEntry();
+}
+
+function updateEnd(dt) {
+  boat.update(dt, { x: 0, y: 0 }, BOUNDS);
+  g.endT += dt;
+  const tap = Input.takeTap(), hit = tap ? UI.endAt(tap.x, tap.y) : null;
+  if (Input.wasPressed('Escape') || (g.endT > 1 && hit === 'menu')) toMenu();
+  else if (g.endT > 1 && (Input.wasPressed('Space') || Input.wasPressed('Enter') || hit === 'retry')) startGame();
+}
+
+function update(dt) {
+  time += dt;
+  const b = Input.takeButton();
+  if (b) doButton(b);
+  if (Input.wasPressed('KeyM')) doButton('sound');
+  if (Input.wasPressed('KeyC')) doButton('crt');
+  if (Input.wasPressed('KeyP')) doButton('pause');
+  if (paused) { updatePaused(); Input.endFrame(); return; }
+  Particles.update(dt);
+  shake = shake < 0.2 ? 0 : shake * Math.exp(-7 * dt);
+  if (state === STATE.MENU) updateMenu(dt);
+  else if (state === STATE.PLAYING) updatePlaying(dt);
+  else if (state === STATE.ENTRY) updateEntry(dt);
+  else updateEnd(dt);
+  for (const p of popups) p.update(dt);
+  popups = popups.filter(p => p.life > 0);
+  Input.endFrame();
+}
+
+/* ---------- AGUA ANIMADA ---------- */
+function drawTile(tile, ox, oy) {
+  const x0 = -(((Math.floor(ox) % 64) + 64) % 64), y0 = -(((Math.floor(oy) % 64) + 64) % 64);
+  for (let y = y0; y < H; y += 64) for (let x = x0; x < W; x += 64) ctx.drawImage(tile, x, y);
+}
+
+function drawWater(t) {
+  ctx.fillStyle = PAL.sea2; ctx.fillRect(0, 0, W, H);
+  drawTile(Sprites.waterA, t * 5, t * 4);
+  for (let y = 0; y < H; y++) {
+    const s = Math.sin(y * 0.11 - t * 1.1);
+    if (s <= 0.93) continue;
+    const ox = -8 + Math.round(Math.sin(y * 0.21 + t * 1.3) * 4);
+    const p = (((y + ox) % 2) + 2) % 2;
+    ctx.drawImage((s > 0.99 ? Sprites.swellTop : Sprites.swellMid)[p], ox, y);
+  }
+  drawTile(Sprites.waterB[Math.floor(t * 5) % 4], t * 11, t * 8);
+}
+
+/* ---------- DIBUJO ---------- */
+function render() {
+  if (state === STATE.MENU && menuScreen !== 'main') {            // pantallas completas del menú
+    if (menuScreen === 'help') UI.drawHelp(ctx, W, H, time); else UI.drawRecords(ctx, W, H, records, time);
+    UI.drawButtons(ctx, state, Audio8.muted, crtOn);
+    return;
+  }
+  ctx.fillStyle = PAL.sea2; ctx.fillRect(0, 0, W, H);            // fondo fijo para que el temblor no deje bordes
+  ctx.save();
+  if (shake > 0) ctx.translate(Math.round(rand(-shake, shake)), Math.round(rand(-shake, shake)));
+  drawWater(time);
+  for (const c of currents) c.draw(ctx, time);
+  Port.draw(ctx, time, state === STATE.PLAYING && boat.load > 0);
+  for (const w of whirls) w.draw(ctx, time);
+  for (const r of rocks) r.draw(ctx, time);
+  for (const b of buoys) b.draw(ctx, time);
+  for (const u of powerups) u.draw(ctx);
+  for (const c of castaways) c.draw(ctx);
+  for (const s of sharks) s.draw(ctx);
+  boat.draw(ctx);
+  Particles.draw(ctx);
+  for (const p of popups) p.draw(ctx);
+  ctx.restore();
+  if (state === STATE.PLAYING) {
+    UI.drawHUD(ctx, W, g);
+    UI.drawFx(ctx, boat);
+    if (banner) UI.drawBanner(ctx, W, banner);
+    else if (playT < 8) UI.drawHint(ctx, W, H);
+    if (paused) UI.drawPause(ctx, W, H);
+  } else if (state === STATE.END) {
+    UI.drawHUD(ctx, W, g);
+    UI.drawEnd(ctx, W, H, g, time, records, newRec);
+  } else if (state === STATE.ENTRY) {
+    UI.drawHUD(ctx, W, g);
+    UI.drawEntry(ctx, W, H, g, entry, time);
+  } else {
+    UI.drawTitle(ctx, W, H, time, menuSel);
+  }
+  UI.drawButtons(ctx, state, Audio8.muted, crtOn);
+  Input.drawStick(ctx);
+}
+
+/* ---------- BUCLE PRINCIPAL ---------- */
+let last = 0, acc = 0;
+function frame(ts) {
+  acc += Math.min(0.1, (ts - last) / 1000);
+  last = ts;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* ---------- ARRANQUE ---------- */
+Sprites.init(W, H);
+Input.init(canvas, W, H);
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+// Pausa automática al perder el foco (útil en móvil)
+const autoPause = () => { if (state === STATE.PLAYING && !paused) setPause(true); };
+document.addEventListener('visibilitychange', () => { if (document.hidden) autoPause(); });
+window.addEventListener('blur', autoPause);
+resize();
+if (document.fonts && document.fonts.load) document.fonts.load('8px "Press Start 2P"').catch(() => {});
+toMenu();
+last = performance.now();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
